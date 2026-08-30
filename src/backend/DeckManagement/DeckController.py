@@ -98,15 +98,14 @@ def _hash_image(image: Image.Image) -> bytes:
 # from under it. Dropping the cache's reference lets refcount/GC reclaim the
 # image once the last user is done with it.
 # ---------------------------------------------------------------------------
+# GIF frame cache budgets. Sized to keep ONE animated page resident - the home
+# page in this repo's measurements runs ~10 GIFs totaling ~40M px of frames.
+# 48M px (~192MB RGBA) holds that page without the constant eviction/re-decode
+# thrash the old 32M budget caused, while still evicting other pages' frames
+# when the user switches pages (a much bigger budget retained every page ever
+# visited, which ballooned memory).
 # ---------------------------------------------------------------------------
-# GIF frame cache budgets. Sized so a whole animated page stays resident: the
-# deck in this repo's measurements runs ~10 GIFs totaling ~40M px of frames on
-# a single page - the old 32M budget forced constant eviction, re-decoding
-# GIF frames (sequential seek) on every loop. 128M px (~512MB RGBA) holds a
-# full animated page plus headroom for page switching; 48M px (~192MB) holds
-# every resized key layer of the same page.
-# ---------------------------------------------------------------------------
-_GIF_FRAME_CACHE_MAX_PIXELS = 128_000_000  # ~512 MB of RGBA frames
+_GIF_FRAME_CACHE_MAX_PIXELS = 48_000_000  # ~192 MB of RGBA frames
 _GIF_FRAME_CACHE_MAX_SIDE = 256  # longest side of a cached frame (see KeyGIF)
 
 
@@ -148,7 +147,7 @@ class _GifFrameCache:
 _GIF_FRAME_CACHE = _GifFrameCache()
 # Resized key layers (per GIF path/frame + target size + fill mode). Stored
 # small (<= target size), so a 90-frame GIF at 136px costs ~6.6 MB.
-_GIF_RENDER_CACHE = _GifFrameCache(max_pixels=48_000_000)
+_GIF_RENDER_CACHE = _GifFrameCache(max_pixels=24_000_000)
 
 
 @dataclass
@@ -2336,12 +2335,19 @@ class LabelManager:
         # leftover page label colors.
         page_label = self.page_labels.get(position)
         if page_label is not None:
-            for prop in ("text", "font_name", "font_size", "font_weight",
+            for prop in ("font_name", "font_size", "font_weight",
                          "style", "outline_width", "outline_color",
                          "alignment", "line_height"):
                 page_value = getattr(page_label, prop)
                 if page_value is not None:
                     setattr(label, prop, page_value)
+            # Text is special: an empty string ("" - what the label editor
+            # writes for a cleared text field) counts as "no text", so the
+            # action can still fill the label. Only real page text overrides
+            # what the action set.
+            page_text = page_label.text
+            if page_text not in (None, ""):
+                label.text = page_text
             if label.color is None and page_label.color is not None:
                 label.color = page_label.color
 

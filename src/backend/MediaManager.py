@@ -87,10 +87,12 @@ class MediaManager:
     def generate_gif_thumbnail(self, file_path):
         # This is the same as load_video but with transparency support
         gif = Image.open(file_path)
+        # n_frames comes from the GIF header - no need to decode every frame
+        # just to count them (that made the asset scan burn a whole core on
+        # decks with many/long GIFs).
+        n_frames = getattr(gif, "n_frames", 1)
         iterator = ImageSequence.Iterator(gif)
-        n_frames = 0
-        for frame in iterator: n_frames += 1 #TODO: Find a better way to do this
-        frame = iterator[n_frames // 2] # Gifs tend to have a empty frame at the beginning
+        frame = iterator[max(0, n_frames // 2)]  # Gifs tend to have an empty frame at the beginning
         frame = frame.convert("RGBA")
 
         gif = None

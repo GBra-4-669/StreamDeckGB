@@ -289,11 +289,33 @@ class HeadphoneBattery(ActionBase):
     # Lifecycle
     # ------------------------------------------------------------------ #
     def on_ready(self):
+        self._claim_label_control()
         try:
             self.plugin_base.register_action(self)
         except Exception:
             pass
         self.render(force=True)
+
+    def _claim_label_control(self):
+        """Make sure this action is allowed to set all three label positions
+        (top/center/bottom). The page's label-control-actions config can
+        otherwise silently drop our label updates - the number on the deck
+        then keeps showing a stale value while the persisted one changed."""
+        try:
+            state = self.get_state()
+            if state is None:
+                return
+            index = self.get_own_action_index()
+            if index is None or index < 0:
+                return
+            apm = state.action_permission_manager
+            for position in (0, 1, 2):  # top, center, bottom
+                if apm.get_label_control_index(position) != index:
+                    apm.set_label_control_index(
+                        position, index, reload_pages=False, reload_self=False
+                    )
+        except Exception:
+            pass
 
     def on_remove(self):
         try:

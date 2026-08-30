@@ -67,12 +67,18 @@ class ImageGroup(Adw.PreferencesGroup):
         self.build()
 
     def build(self):
+        # Swap button first, always visible - clicking it copies the image
+        # source and every layout style to the other slot.
+        self.swap_row = SwapLayoutRow(sidebar=self.sidebar, media_key=self.media_key)
+        self.add(self.swap_row)
+
         self.expander = Layout(self, self.media_key, self.title)
         self.add(self.expander)
 
         return
 
     def load_for_identifier(self, identifier: InputIdentifier, state: int):
+        self.swap_row.load_for_identifier(identifier, state)
         self.expander.load_for_identifier(identifier, state)
 
 
@@ -114,6 +120,89 @@ class Layout(Adw.ExpanderRow):
         self.opacity_row.load_for_identifier(identifier, state)
         self.speed_row.load_for_identifier(identifier, state)
         self.blend_mode_row.load_for_identifier(identifier, state)
+
+
+class SwapLayoutRow(Adw.ActionRow):
+    """A prominent button that swaps the key's main image with its second
+    image - the image source AND every layout style (size, valign, halign,
+    opacity, speed, blend mode) move to the other slot and back."""
+
+    def __init__(self, sidebar, media_key="media", **kwargs):
+        self.sidebar = sidebar
+        self.media_key = media_key
+        self.active_identifier: InputIdentifier = None
+        self.active_state: int = None
+        title = (
+            gl.lm.get("right-area.image-editor.layout.swap-with-second", "Swap with second image")
+            if media_key == "media"
+            else gl.lm.get("right-area.image-editor.layout.swap-with-first", "Swap with first image")
+        )
+        subtitle = (
+            gl.lm.get("right-area.image-editor.layout.swap-with-second.subtitle",
+                      "Copy image + layout to the second slot")
+            if media_key == "media"
+            else gl.lm.get("right-area.image-editor.layout.swap-with-first.subtitle",
+                           "Copy image + layout back to the first slot")
+        )
+        super().__init__(title=title, subtitle=subtitle, **kwargs)
+
+        # A real, visible button - not just an activatable row.
+        self.swap_button = Gtk.Button(label="⇄", tooltip_text=title)
+        self.swap_button.add_css_class("suggested-action")
+        self.swap_button.set_valign(Gtk.Align.CENTER)
+        self.add_suffix(self.swap_button)
+        self.set_activatable_widget(self.swap_button)
+        self.swap_button.connect("clicked", self.on_swap)
+
+    def load_for_identifier(self, identifier: InputIdentifier, state: int):
+        self.active_identifier = identifier
+        self.active_state = state
+        # Only keys have a second image slot.
+        self.set_visible(isinstance(identifier, Input.Key))
+
+    def on_swap(self, *args):
+        try:
+            self._perform_swap()
+        except Exception as e:
+            log.error(f"Failed to swap media layouts: {e}")
+
+    def _perform_swap(self):
+        identifier = self.active_identifier
+        state = self.active_state
+        if identifier is None or state is None:
+            return
+        controller = gl.app.main_win.get_active_controller()
+        if controller is None or controller.active_page is None:
+            return
+        page = controller.active_page
+        d = identifier.get_config(page)
+        st = (d.get("states") or {}).get(str(state))
+        if not isinstance(st, dict):
+            return
+
+        media = st.get("media")
+        media2 = st.get("media-2")
+        layout = st.get("layout")
+        layout2 = st.get("media-2-layout")
+
+        # Swap main <-> second (content and layout). A missing side swaps
+        # with the empty slot, so single-image keys just move the image over.
+        st["media"], st["media-2"] = media2, media
+        st["layout"], st["media-2-layout"] = layout2, layout
+        for key in ("media", "media-2", "layout", "media-2-layout"):
+            if st.get(key) is None:
+                st.pop(key, None)
+
+        page.save()
+        gl.page_manager.update_dict_of_pages_with_path(page.json_path)
+        controller.load_input(controller.get_input(identifier), page, update=True)
+
+        # Refresh the sidebar so both layout forms (and the icon selectors)
+        # show the swapped values.
+        try:
+            self.sidebar.key_editor.load_for_identifier(identifier, state)
+        except Exception:
+            pass
 
 
 class SizeRow(Adw.PreferencesRow):
