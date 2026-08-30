@@ -73,6 +73,10 @@ class FakeKeyInput:
     def __init__(self, identifier=None):
         self.identifier = identifier if identifier is not None else Input.Key("0x0")
         self.deck_controller = None
+        self.media_ticks = 0
+
+    def get_image_size(self):
+        return (72, 72)
 
     def _mark_content_dirty(self):
         pass
@@ -129,7 +133,6 @@ class GifFrameCacheTest(unittest.TestCase):
             finally:
                 _GIF_FRAME_CACHE._max_pixels = original_max
                 _GIF_FRAME_CACHE._cache.clear()
-                _GIF_FRAME_CACHE._order.clear()
                 _GIF_FRAME_CACHE._pixels = 0
                 gif.close()
 

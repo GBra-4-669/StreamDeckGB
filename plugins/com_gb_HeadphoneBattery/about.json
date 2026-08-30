@@ -1,0 +1,14 @@
+{
+    "author": "gb",
+    "copyright": "Copyright (C) 2026 gb",
+    "support": "https://github.com/gb/streamdeck-headphone-battery",
+    "comments": {
+        "en_US": "Listens to BlueZ org.bluez.Battery1 signals (GDBus) for the paired Px7 S2e headphone. Zero polling: the key updates only when BlueZ reports a new battery percentage. The last known value is stored in the action settings, so it stays visible while the headphones are powered off."
+    },
+    "credits": {
+        "Developer": ["gb"]
+    },
+    "acknowledgements": {
+        "Trademarks": ["Bluetooth is a trademark of Bluetooth SIG, Inc. Px7 S2e is a trademark of Bowers & Wilkins. This is an unofficial, personal plugin and is not affiliated with either."]
+    }
+}

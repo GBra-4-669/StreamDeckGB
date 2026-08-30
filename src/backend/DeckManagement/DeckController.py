@@ -20,6 +20,7 @@ import threading
 import time
 # Import Python modules
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from copy import copy
 from dataclasses import dataclass
 from queue import Queue
@@ -97,7 +98,15 @@ def _hash_image(image: Image.Image) -> bytes:
 # from under it. Dropping the cache's reference lets refcount/GC reclaim the
 # image once the last user is done with it.
 # ---------------------------------------------------------------------------
-_GIF_FRAME_CACHE_MAX_PIXELS = 32_000_000  # ~128 MB of RGBA frames
+# ---------------------------------------------------------------------------
+# GIF frame cache budgets. Sized so a whole animated page stays resident: the
+# deck in this repo's measurements runs ~10 GIFs totaling ~40M px of frames on
+# a single page - the old 32M budget forced constant eviction, re-decoding
+# GIF frames (sequential seek) on every loop. 128M px (~512MB RGBA) holds a
+# full animated page plus headroom for page switching; 48M px (~192MB) holds
+# every resized key layer of the same page.
+# ---------------------------------------------------------------------------
+_GIF_FRAME_CACHE_MAX_PIXELS = 128_000_000  # ~512 MB of RGBA frames
 _GIF_FRAME_CACHE_MAX_SIDE = 256  # longest side of a cached frame (see KeyGIF)
 
 
@@ -106,12 +115,12 @@ class _GifFrameCache:
     frames, or (path, frame, size, fill) for resized key layers), evicted by a
     pixel budget. Entries are dropped without close(): a renderer on another
     thread may still hold a reference, and PIL's close() frees the backing
-    buffer out from under it."""
+    buffer out from under it. Backed by an OrderedDict so get/put stay O(1)
+    even with hundreds of cached frames - this is on the per-tick hot path."""
 
     def __init__(self, max_pixels: int = _GIF_FRAME_CACHE_MAX_PIXELS) -> None:
         self._max_pixels = max_pixels
-        self._cache: dict[tuple, Image.Image] = {}
-        self._order: list[tuple] = []
+        self._cache: "OrderedDict[tuple, Image.Image]" = OrderedDict()
         self._pixels = 0
         self._lock = threading.Lock()
 
@@ -120,31 +129,26 @@ class _GifFrameCache:
             image = self._cache.get(key)
             if image is not None:
                 # Refresh LRU position.
-                self._order.remove(key)
-                self._order.append(key)
+                self._cache.move_to_end(key)
             return image
 
     def put(self, key: tuple, image: Image.Image) -> None:
         pixels = image.size[0] * image.size[1]
         with self._lock:
-            existing = self._cache.get(key)
-            if existing is not None:
-                self._order.remove(key)
+            if key in self._cache:
+                self._cache.move_to_end(key)
             else:
                 self._pixels += pixels
             self._cache[key] = image
-            self._order.append(key)
-            while self._pixels > self._max_pixels and self._order:
-                evict_key = self._order.pop(0)
-                evicted = self._cache.pop(evict_key, None)
-                if evicted is not None:
-                    self._pixels -= evicted.size[0] * evicted.size[1]
+            while self._pixels > self._max_pixels and self._cache:
+                evict_key, evicted = self._cache.popitem(last=False)
+                self._pixels -= evicted.size[0] * evicted.size[1]
 
 
 _GIF_FRAME_CACHE = _GifFrameCache()
 # Resized key layers (per GIF path/frame + target size + fill mode). Stored
 # small (<= target size), so a 90-frame GIF at 136px costs ~6.6 MB.
-_GIF_RENDER_CACHE = _GifFrameCache(max_pixels=16_000_000)
+_GIF_RENDER_CACHE = _GifFrameCache(max_pixels=48_000_000)
 
 
 @dataclass
@@ -2105,6 +2109,10 @@ class KeyGIF(SingleKeyAsset):
 
         self.active_frame: int = -1
 
+        # Cache the absolute path - get_next_frame/get_render_layer run on the
+        # per-tick hot path and os.path.abspath() would be repeated per frame.
+        self.gif_abs_path: str = os.path.abspath(self.gif_path)
+
         # Open GIF and extract frame delays only (metadata - cheap).
         # Frames are decoded on-demand via seek() to avoid upfront memory cost.
         self.gif = Image.open(self.gif_path)
@@ -2131,14 +2139,14 @@ class KeyGIF(SingleKeyAsset):
         # the cache, so a 600x600 frame would otherwise be BILINEAR-resized on
         # every render (~2ms each); a 256px source resizes in ~0.4ms and the
         # cap also makes the cache hold ~5x more frames.
-        frame = _GIF_FRAME_CACHE.get((os.path.abspath(self.gif_path), self.active_frame))
+        frame = _GIF_FRAME_CACHE.get((self.gif_abs_path, self.active_frame))
         if frame is None:
             self.gif.seek(self.active_frame)
             frame = self.gif.convert("RGBA")
             if max(frame.size) > _GIF_FRAME_CACHE_MAX_SIDE:
                 frame.thumbnail((_GIF_FRAME_CACHE_MAX_SIDE, _GIF_FRAME_CACHE_MAX_SIDE),
                                 Image.Resampling.BILINEAR)
-            _GIF_FRAME_CACHE.put((os.path.abspath(self.gif_path), self.active_frame), frame)
+            _GIF_FRAME_CACHE.put((self.gif_abs_path, self.active_frame), frame)
         return frame
     
     def get_render_layer(self, layout_manager: "LayoutManager", background_size: tuple[int, int]) -> Image.Image | None:
@@ -2152,7 +2160,7 @@ class KeyGIF(SingleKeyAsset):
             return None
 
         frame = self.get_next_frame()
-        cache_key = (os.path.abspath(self.gif_path), self.active_frame, image_size, layout.fill_mode)
+        cache_key = (self.gif_abs_path, self.active_frame, image_size, layout.fill_mode)
         cached = _GIF_RENDER_CACHE.get(cache_key)
         if cached is not None:
             return cached
@@ -2175,7 +2183,7 @@ class KeyGIF(SingleKeyAsset):
     def get_preview_image(self) -> Image.Image | None:
         """Current frame without advancing the animation (for GUI previews)."""
         frame = max(self.active_frame, 0)
-        cached = _GIF_FRAME_CACHE.get((os.path.abspath(self.gif_path), frame))
+        cached = _GIF_FRAME_CACHE.get((self.gif_abs_path, frame))
         if cached is not None:
             return cached
         try:
@@ -2184,7 +2192,7 @@ class KeyGIF(SingleKeyAsset):
             if max(decoded.size) > _GIF_FRAME_CACHE_MAX_SIDE:
                 decoded.thumbnail((_GIF_FRAME_CACHE_MAX_SIDE, _GIF_FRAME_CACHE_MAX_SIDE),
                                   Image.Resampling.BILINEAR)
-            _GIF_FRAME_CACHE.put((os.path.abspath(self.gif_path), frame), decoded)
+            _GIF_FRAME_CACHE.put((self.gif_abs_path, frame), decoded)
             return decoded
         except Exception:
             return None
@@ -2206,6 +2214,11 @@ class LabelManager:
         self.action_labels = {}
         self.scroll_wait = 25
         self._has_scroll_labels_cache: bool = None
+
+        # Cached static label layer (drawn once per label state + key size) and
+        # its signature - see _get_static_label_layer.
+        self._label_layer: "Image.Image" = None
+        self._label_layer_sig: tuple = None
 
         self.init_labels()
         self.frames: dict[str, dict[str, int]] = {
@@ -2313,33 +2326,22 @@ class LabelManager:
         }
 
     def get_composed_label(self, position: str) -> str:
-        use_page_label_properties = self.get_use_page_label_properties(position)
-        
         label = copy(self.action_labels.get(position)) or KeyLabel(self.controller_input)
 
-        # Set to page values
+        # Actions win: an explicitly-set action value overrides the page
+        # template, and the page fills in anything the action left unset.
+        # (Previously the page won whenever it had a value, so a page label
+        # with text="" or a leftover color could stomp what an action drew -
+        # e.g. an action's zone color never reached top/bottom labels.)
         page_label = self.page_labels.get(position)
         if page_label is not None:
-            if use_page_label_properties["text"]:
-                label.text = page_label.text
-            if use_page_label_properties["color"]:
-                label.color = page_label.color
-            if use_page_label_properties["font-family"]:
-                label.font_name = page_label.font_name
-            if use_page_label_properties["font-size"]:
-                label.font_size = page_label.font_size
-            if use_page_label_properties["font-weight"]:
-                label.font_weight = page_label.font_weight
-            if use_page_label_properties["font-style"]:
-                label.style = page_label.style
-            if use_page_label_properties["outline_width"]:
-                label.outline_width = page_label.outline_width
-            if use_page_label_properties["outline_color"]:
-                label.outline_color = page_label.outline_color
-            if use_page_label_properties["alignment"]:
-                label.alignment = page_label.alignment
-            if use_page_label_properties["line_height"]:
-                label.line_height = page_label.line_height
+            for prop in ("text", "color", "font_name", "font_size", "font_weight",
+                         "style", "outline_width", "outline_color",
+                         "alignment", "line_height"):
+                if getattr(label, prop) is None:
+                    page_value = getattr(page_label, prop)
+                    if page_value is not None:
+                        setattr(label, prop, page_value)
 
         injected = self.inject_defaults(label)
         return self.fix_invalid(injected)
@@ -2402,27 +2404,30 @@ class LabelManager:
         self._has_scroll_labels_cache = False
         return False
 
-    def add_labels_to_image(self, image: Image.Image) -> Image.Image:
-        # image = image.rotate(self.deck.get_rotation()*-1)
-        draw = ImageDraw.Draw(image)
-
-        labels = self.get_composed_labels()
-        for label in labels:
-            text = labels[label].text
+    def _draw_composed_labels(self, draw, labels: dict, image_size: tuple[int, int], allow_scroll: bool) -> None:
+        """Draw the composed labels onto `draw`. Positioning is identical to the
+        historical inline loop. Scrolling is only allowed on the live path - the
+        cached static label layer never scrolls, so its cache signature stays
+        stable."""
+        width, height = image_size
+        rolling_labels_enabled = gl.settings_manager.get_app_settings().get("general", {}).get("rolling-labels", True)
+        for position in labels:
+            label = labels[position]
+            text = label.text
             if text in [None, ""]:
                 continue
 
-            color = tuple(labels[label].color)
-            font = labels[label].get_font()
-            outline_width = labels[label].outline_width
-            outline_color = tuple(labels[label].outline_color)
-            alignment = labels[label].alignment
+            color = tuple(label.color)
+            font = label.get_font()
+            outline_width = label.outline_width
+            outline_color = tuple(label.outline_color)
+            alignment = label.alignment
 
             _, _, w, h = draw.textbbox((0, 0), text, font=font)
             # CSS-like line height: scale the line box the label is positioned
             # by. Top labels move down / bottom labels move up with more line
             # height; centered labels stay centered.
-            h = h * (labels[label].line_height or 1.0)
+            h = h * (label.line_height or 1.0)
 
             # Calculate x position based on alignment
             padding = 3
@@ -2430,52 +2435,98 @@ class LabelManager:
                 x_position = padding
                 anchor_x = "l"
             elif alignment == "right":
-                x_position = image.width - padding
+                x_position = width - padding
                 anchor_x = "r"
             else:  # center (default)
-                x_position = image.width / 2
+                x_position = width / 2
                 anchor_x = "m"
 
-            rolling_labels_enabled = gl.settings_manager.get_app_settings().get("general", {}).get("rolling-labels", True)
-            if rolling_labels_enabled and image.width < w:
+            if allow_scroll and rolling_labels_enabled and width < w:
                 # Need to scroll - always use center anchor for scrolling
-                start = image.width / 2 - (image.width - w) / 2 + 10
-                stop = image.width / 2 + (image.width - w) / 2 - 10
+                start = width / 2 - (width - w) / 2 + 10
+                stop = width / 2 + (width - w) / 2 - 10
 
-                x_position = start - self.frames[label]["position"]
+                x_position = start - self.frames[position]["position"]
                 anchor_x = "m"
                 if x_position < stop:
-                    if self.frames[label]["wait"] == 0:
+                    if self.frames[position]["wait"] == 0:
                         x_position = start
-                        self.frames[label]["position"] = 0
-                        self.frames[label]["wait"] = self.scroll_wait
+                        self.frames[position]["position"] = 0
+                        self.frames[position]["wait"] = self.scroll_wait
                     else:
-                        self.frames[label]["wait"] -= 1
+                        self.frames[position]["wait"] -= 1
                 elif self.controller_input.media_ticks % 2 == 0:
-                    if self.frames[label]["wait"] == 0:
+                    if self.frames[position]["wait"] == 0:
                         if x_position == stop:
-                            self.frames[label]["wait"] = self.scroll_wait
+                            self.frames[position]["wait"] = self.scroll_wait
 
-                        self.frames[label]["position"] += 1
+                        self.frames[position]["position"] += 1
                     else:
-                        self.frames[label]["wait"] -= 1
+                        self.frames[position]["wait"] -= 1
 
-
-            if label == "top":
-                position = (x_position, h/2 + 3)
-            elif label == "bottom":
-                position = (x_position, image.height - h/2 - 3)
+            if position == "top":
+                text_position = (x_position, h/2 + 3)
+            elif position == "bottom":
+                text_position = (x_position, height - h/2 - 3)
             else:
-                position = (x_position, (image.height - 0) / 2)
+                text_position = (x_position, (height - 0) / 2)
 
             # Use appropriate anchor based on alignment (x-anchor + "m" for vertical middle)
             anchor = anchor_x + "m"
 
-            draw.text(position,
+            draw.text(text_position,
                       text=text, font=font, anchor=anchor, align=alignment,
                       fill=color, stroke_width=outline_width,
                       stroke_fill=outline_color)
 
+    def _static_label_signature(self, labels: dict, image_size: tuple[int, int]) -> tuple:
+        """Everything that shapes the rendered static label layer."""
+        parts = [image_size]
+        for position in ("top", "center", "bottom"):
+            lbl = labels[position]
+            parts.append((
+                lbl.text, tuple(lbl.color), lbl.font_name, lbl.font_size,
+                lbl.font_weight, lbl.style, lbl.outline_width,
+                tuple(lbl.outline_color), lbl.alignment, lbl.line_height,
+            ))
+        return tuple(parts)
+
+    def _get_static_label_layer(self, labels: dict, image_size: tuple[int, int]) -> "Image.Image":
+        """The labels drawn once onto a transparent layer, cached per (label
+        state, key size). Static labels are re-rendered (font shaping + stroked
+        text, ~0.5-1ms) on every media tick otherwise - most visibly on keys
+        whose content bypasses the content cache (blend-mode layers)."""
+        sig = self._static_label_signature(labels, image_size)
+        if self._label_layer_sig == sig and self._label_layer is not None:
+            return self._label_layer
+
+        layer = Image.new("RGBA", image_size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        self._draw_composed_labels(draw, labels, image_size, allow_scroll=False)
+        del draw
+
+        if self._label_layer is not None:
+            self._label_layer.close()
+        self._label_layer = layer
+        self._label_layer_sig = sig
+        return layer
+
+    def add_labels_to_image(self, image: Image.Image) -> Image.Image:
+        labels = self.get_composed_labels()
+
+        # Static labels are drawn once per (label state, key size) and then
+        # composited, instead of being re-rendered on every media tick.
+        # Scrolling labels are exempt - their position advances inside the draw
+        # loop - and so is anything that is not RGBA (the composite requires it;
+        # the direct draw below handles every mode as before).
+        if not self.get_has_scroll_labels() and image.mode == "RGBA":
+            layer = self._get_static_label_layer(labels, image.size)
+            if layer is not None:
+                image.alpha_composite(layer)
+                return image.copy()
+
+        draw = ImageDraw.Draw(image)
+        self._draw_composed_labels(draw, labels, image.size, allow_scroll=True)
         del draw
 
         return image.copy()
