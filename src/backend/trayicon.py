@@ -285,7 +285,9 @@ class DBusMenuService(DBusService):
         if idx in self.idToItems:
             item = self.idToItems[idx]
             if 'callback' in item:
-                item['callback']()
+                # Defer the callback so the D-Bus reply is never delayed by it
+                # (a slow callback makes tray hosts time out with NoReply).
+                GLib.idle_add(item['callback'])
 
     def EventGroup(self, events):
         not_found = []
@@ -300,12 +302,17 @@ class DBusMenuService(DBusService):
 
             item = self.idToItems[idx]
             if 'callback' in item:
-                item['callback']()
+                GLib.idle_add(item['callback'])
 
         return not_found
 
     def AboutToShow(self, item_id):
-        return (False,)
+        # Ask the tray host to re-fetch the layout every time the menu is
+        # about to be shown. The LayoutUpdated emitted at menu construction
+        # happens before the object is registered (and is lost), so a host
+        # that cached an empty/stale layout would otherwise keep showing no
+        # options until something else forced a refresh.
+        return (True,)
 
     def AboutToShowGroup(self, ids):
         not_found = []
@@ -363,6 +370,13 @@ class StatusNotifierItemService(DBusService):
         super().register()
         self.registered = True
 
+        # The LayoutUpdated emitted when the menu items were set happened
+        # before the menu object was registered, so no host ever received it.
+        # Re-emit it now that the object is live so tray hosts that connected
+        # or cached the layout during startup refresh to the current items.
+        self._layout_update_sources = []
+        self._emit_layout_update()
+
         # A StatusNotifierWatcher only exists if the desktop actually hosts tray icons;
         # on GNOME for example it comes from the AppIndicator extension. Watching the name
         # instead of calling it right away keeps us from failing on desktops without one
@@ -387,6 +401,22 @@ class StatusNotifierItemService(DBusService):
         ).unpack()[0]:
             self.on_watcher_appeared(self.bus, WATCHER_BUS_NAME, WATCHER_BUS_NAME)
 
+        # Startup race: a host that registered the item while the app was
+        # still coming up may have cached an empty layout (a GetLayout that
+        # raced our startup work, before AboutToShow/retries could help).
+        # Emit LayoutUpdated again a few seconds later, once the app has
+        # settled, so such hosts refresh to the real items.
+        self._layout_update_sources.append(GLib.timeout_add(
+            5000,
+            lambda: (self._emit_layout_update(), False)[1],
+        ))
+
+    def _emit_layout_update(self):
+        try:
+            self._menu.LayoutUpdate(self._menu.revision, 0)
+        except Exception:
+            pass
+
     def on_watcher_appeared(self, connection, name, name_owner):
         try:
             connection.call_sync(
@@ -401,6 +431,9 @@ class StatusNotifierItemService(DBusService):
                 cancellable=None,
             )
             log.info(f"Registered tray icon {self.dbus_path} with {WATCHER_BUS_NAME}")
+            # The host only learns about menu changes through LayoutUpdated;
+            # announce the current layout right after (re-)registering.
+            self._emit_layout_update()
         except GLib.Error as e:
             log.error(f"Failed to register tray icon with {WATCHER_BUS_NAME}: {e.message}")
 

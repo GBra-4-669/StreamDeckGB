@@ -2328,20 +2328,22 @@ class LabelManager:
     def get_composed_label(self, position: str) -> str:
         label = copy(self.action_labels.get(position)) or KeyLabel(self.controller_input)
 
-        # Actions win: an explicitly-set action value overrides the page
-        # template, and the page fills in anything the action left unset.
-        # (Previously the page won whenever it had a value, so a page label
-        # with text="" or a leftover color could stomp what an action drew -
-        # e.g. an action's zone color never reached top/bottom labels.)
+        # Merge the page template with the action's label. The page wins for
+        # the shape properties (text, font, outline, alignment, line height) -
+        # actions like the clock rely on the page's font-size. The one
+        # exception is color: an explicitly-set action color wins over the
+        # page color, so e.g. a battery zone color is not overridden by
+        # leftover page label colors.
         page_label = self.page_labels.get(position)
         if page_label is not None:
-            for prop in ("text", "color", "font_name", "font_size", "font_weight",
+            for prop in ("text", "font_name", "font_size", "font_weight",
                          "style", "outline_width", "outline_color",
                          "alignment", "line_height"):
-                if getattr(label, prop) is None:
-                    page_value = getattr(page_label, prop)
-                    if page_value is not None:
-                        setattr(label, prop, page_value)
+                page_value = getattr(page_label, prop)
+                if page_value is not None:
+                    setattr(label, prop, page_value)
+            if label.color is None and page_label.color is not None:
+                label.color = page_label.color
 
         injected = self.inject_defaults(label)
         return self.fix_invalid(injected)
@@ -2423,11 +2425,15 @@ class LabelManager:
             outline_color = tuple(label.outline_color)
             alignment = label.alignment
 
-            _, _, w, h = draw.textbbox((0, 0), text, font=font)
+            _, _, w, h_raw = draw.textbbox((0, 0), text, font=font)
             # CSS-like line height: scale the line box the label is positioned
             # by. Top labels move down / bottom labels move up with more line
-            # height; centered labels stay centered.
-            h = h * (label.line_height or 1.0)
+            # height. Centered labels respond too: the box grows around the
+            # key's vertical center and the text is offset by half the growth,
+            # so line height 1.0 stays exactly centered and larger values
+            # nudge it down (smaller values up).
+            line_height = label.line_height or 1.0
+            h = h_raw * line_height
 
             # Calculate x position based on alignment
             padding = 3
@@ -2469,7 +2475,9 @@ class LabelManager:
             elif position == "bottom":
                 text_position = (x_position, height - h/2 - 3)
             else:
-                text_position = (x_position, (height - 0) / 2)
+                # Center: line height nudges the label by half the line box
+                # growth instead of pinning it to the key's middle forever.
+                text_position = (x_position, (height - 0) / 2 + (h - h_raw) / 2)
 
             # Use appropriate anchor based on alignment (x-anchor + "m" for vertical middle)
             anchor = anchor_x + "m"

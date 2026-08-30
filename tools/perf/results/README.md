@@ -55,29 +55,3 @@ Per-frame render timing (debug builds) shows up in the app log as
   frames (bg_ms ~0.00), and keys only re-render when the frame they show
   underneath actually changed. Verified live: home tick ~7-12ms, ai page
   median tick ~4.4ms with near-idle gaps between background frames.
-
-## Follow-up 2: asset-level precompute
-
-- **Static assets (SVG/PNG) are resized once per layout**, not per render:
-  `InputImage.get_render_layer()` caches the cover/contain/stretch at the
-  composed layout size (the asset's image is immutable, so it is a constant).
-- **GIF frames are resized once per frame**: `KeyGIF.get_render_layer()` caches
-  each frame's resize keyed by (path, frame, target size, fill mode) in a
-  global pixel-budgeted LRU, so a looping GIF's frames are resized on first
-  pass only.
-- **The two images on a key are precomputed into one for animated keys too**:
-  when media is animated and media-2 is static (GIF + icon/badge), media-2 +
-  labels + decorations are composited once into a static overlay; each frame
-  only re-composites the moving layer underneath it. (Static keys already
-  composited both layers once via the content cache.)
-- `LayoutManager.add_image_to_background(..., pre_resized=True)` consumes the
-  cached layers without re-resizing and never mutates shared images.
-
-Measured on home (same setup): tick median ~10ms -> ~5.5ms, CPU 28.3% ->
-20.8%, package power 53.1W -> 42.5W, Tctl ~71-72C, no errors, page switching
-works. 30 unit tests pass.
-
-Note: blend modes (hard-light/overlay) use the pre-existing simplified formulas
-(multiply/screen keyed on brightness, not the W3C scaled forms); the fast path
-matches that reference within <=3/255. Flagged by the user as "not perfect" -
-kept as-is for now.

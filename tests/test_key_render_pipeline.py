@@ -673,9 +673,9 @@ class LineHeightTest(unittest.TestCase):
         self.assertIsNotNone(b2)
         self.assertLess(b2, b1, "higher line height must push a bottom label up")
 
-    def test_center_label_stays(self):
+    def test_center_label_moves_down_with_line_height(self):
         t1 = self._topmost(self._render("center", 1.0))
         t2 = self._topmost(self._render("center", 2.0))
         self.assertIsNotNone(t1)
         self.assertIsNotNone(t2)
-        self.assertEqual(t1, t2, "line height must not move centered labels")
+        self.assertGreater(t2, t1, "higher line height must push a centered label down")
