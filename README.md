@@ -18,7 +18,7 @@ If the videos do not work or play inline, you can find them also on the [demo pa
 
 - **No prebuilt binaries.** There is no installer and no release build.
 - **No support.** This will almost certainly not run as-is on your machine; expect to read and modify the source to make it work on your own setup.
-- **Use at your own risk.**.
+- **Use at your own risk.**
 
 All credit for the core application goes to the [StreamController](https://github.com/StreamController/StreamController) team. It is actively maintained and has far more features and broader hardware support than this fork will ever have. Please star, contribute to, and use the upstream project instead of this one.
 
@@ -32,7 +32,7 @@ All credit for the core application goes to the [StreamController](https://githu
 - **Static WebP support**: support for static `.webp` images as key and background assets.
 - **Accurate GIF timing**: animated GIFs play at their native frame delays.
 - **Playback pacing**: animated backgrounds play at their configured or native frame rate.
-- **Smooth animated decks**: a frame pipeline decodes and resizes animated GIFs once per frame, caches each key's layers, and re-renders only what actually changed — animated pages stay at a steady 30 fps with modest CPU and temperature.
+- **Smooth animated decks**: a frame pipeline decodes and resizes animated GIFs once per frame, caches each key's layers, and re-renders only what actually changed.
 - **The deck switches off at shutdown**: when the system shuts down or you log out, the deck's screens go black (brightness 0) while USB power stays on, so it does not stay lit while the machine is off.
 
 ## Tested on

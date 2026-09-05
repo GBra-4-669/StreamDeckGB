@@ -463,21 +463,11 @@ class MediaPlayerThread(threading.Thread):
 
             end = time.time()
 
-            # Use low FPS when idle (no animated content, no pending tasks)
-            has_pending = bool(self.tasks or self.image_tasks or self.touchscreen_task or self.touchscreen_region_tasks)
-            if has_pending or has_bg_video or getattr(self, '_cached_needs_ticks', False):
-                target_fps = self.FPS
-            else:
-                target_fps = 2  # Idle: just check for new tasks occasionally
-
+            # The deck is an animated screen: always render at the full FPS.
             self.append_fps(1 / (end - start))
             self.update_low_fps_warning()
-            wait = max(0, 1/target_fps - (end - start))
-            if target_fps < self.FPS:
-                self._wake_event.wait(wait)
-                self._wake_event.clear()
-            else:
-                time.sleep(wait)
+            wait = max(0, 1/self.FPS - (end - start))
+            time.sleep(wait)
 
             if self._stop_requested:
                 break
@@ -2399,26 +2389,16 @@ class LabelManager:
         return self.controller_input.get_image_size()[0]
 
     def get_has_scroll_labels(self) -> bool:
-        if self._has_scroll_labels_cache is not None:
-            return self._has_scroll_labels_cache
-
-        labels = self.get_composed_labels()
-        for label in labels:
-            if labels[label].text is not None and labels[label].text != "":
-                _, _, w, _ = labels[label].get_font().getbbox(labels[label].text)
-                if w > self.get_available_width():
-                    self._has_scroll_labels_cache = True
-                    return True
-        self._has_scroll_labels_cache = False
+        # Scrolling labels are intentionally disabled (noop): labels are always
+        # drawn statically, so the static label layer cache is always used and
+        # fonts are never re-shaped per media tick.
         return False
 
-    def _draw_composed_labels(self, draw, labels: dict, image_size: tuple[int, int], allow_scroll: bool) -> None:
+    def _draw_composed_labels(self, draw, labels: dict, image_size: tuple[int, int]) -> None:
         """Draw the composed labels onto `draw`. Positioning is identical to the
-        historical inline loop. Scrolling is only allowed on the live path - the
-        cached static label layer never scrolls, so its cache signature stays
-        stable."""
+        historical inline loop. Scrolling labels are intentionally disabled:
+        every label renders statically (centered, clipped at the key edges)."""
         width, height = image_size
-        rolling_labels_enabled = gl.settings_manager.get_app_settings().get("general", {}).get("rolling-labels", True)
         for position in labels:
             label = labels[position]
             text = label.text
@@ -2452,29 +2432,6 @@ class LabelManager:
             else:  # center (default)
                 x_position = width / 2
                 anchor_x = "m"
-
-            if allow_scroll and rolling_labels_enabled and width < w:
-                # Need to scroll - always use center anchor for scrolling
-                start = width / 2 - (width - w) / 2 + 10
-                stop = width / 2 + (width - w) / 2 - 10
-
-                x_position = start - self.frames[position]["position"]
-                anchor_x = "m"
-                if x_position < stop:
-                    if self.frames[position]["wait"] == 0:
-                        x_position = start
-                        self.frames[position]["position"] = 0
-                        self.frames[position]["wait"] = self.scroll_wait
-                    else:
-                        self.frames[position]["wait"] -= 1
-                elif self.controller_input.media_ticks % 2 == 0:
-                    if self.frames[position]["wait"] == 0:
-                        if x_position == stop:
-                            self.frames[position]["wait"] = self.scroll_wait
-
-                        self.frames[position]["position"] += 1
-                    else:
-                        self.frames[position]["wait"] -= 1
 
             if position == "top":
                 text_position = (x_position, h/2 + 3)
@@ -2516,7 +2473,7 @@ class LabelManager:
 
         layer = Image.new("RGBA", image_size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(layer)
-        self._draw_composed_labels(draw, labels, image_size, allow_scroll=False)
+        self._draw_composed_labels(draw, labels, image_size)
         del draw
 
         if self._label_layer is not None:
@@ -2540,7 +2497,7 @@ class LabelManager:
                 return image.copy()
 
         draw = ImageDraw.Draw(image)
-        self._draw_composed_labels(draw, labels, image.size, allow_scroll=True)
+        self._draw_composed_labels(draw, labels, image.size)
         del draw
 
         return image.copy()
@@ -3511,8 +3468,8 @@ class ControllerKey(ControllerInput):
 
         The frame indices make an animated key re-render exactly once per new
         frame (i.e. at the animation's own cadence), not at the media loop
-        rate. Scroll label positions are included so scrolling labels still
-        advance, at the cost of a rebuild per scroll step for those keys only.
+        rate. Scroll label positions are kept in the signature for cache
+        stability, but scrolling is disabled so they never change.
         """
         def frame_ref(v) -> int | None:
             return None if v is None else getattr(v, "active_frame", -1)
