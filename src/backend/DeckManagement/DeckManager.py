@@ -141,12 +141,35 @@ class DeckManager:
         n_fake_decks = int(dev_settings.get("n-fake-decks", 0))
         configured_types = dev_settings.get("fake-deck-types", [])
 
+        # Optional: some setups want a fake deck exactly when no hardware is
+        # attached - the app stays usable, and every client that asks for "the"
+        # controller (the DBus API's Controllers, an on-screen deck, a script)
+        # gets the deck in front of it instead of a phantom one. Off by default,
+        # because a fake deck is normally a development aid that coexists with
+        # real hardware.
+        if dev_settings.get("fake-decks-require-no-hardware") and self.has_hardware_deck():
+            return []
+
         types: list[str] = []
         for i in range(n_fake_decks):
             deck_type = configured_types[i] if i < len(configured_types) else None
             types.append(deck_type or DEFAULT_FAKE_DECK_TYPE)
 
         return types
+
+    def has_hardware_deck(self) -> bool:
+        """
+        Is a real deck connected? Fake decks are controllers too, so they have to
+        be excluded or this would answer yes because of one of them.
+        """
+        for controller in self.deck_controller:
+            if controller in self.fake_deck_controller:
+                continue
+            deck = getattr(controller, "deck", None)
+            if isinstance(getattr(deck, "deck", deck), FakeDeck):
+                continue
+            return True
+        return False
 
     def load_fake_decks(self):
         """
@@ -206,6 +229,11 @@ class DeckManager:
 
         self.check_for_errors_if_window_ready()
 
+        # A real deck appeared: re-sync, so a fake deck that is configured to
+        # exist only without hardware steps aside. Via the main loop because this
+        # runs on the USB monitor's thread and load_fake_decks() touches widgets.
+        GLib.idle_add(self.load_fake_decks)
+
 
     def on_disconnect(self, device_id, device_info):
         log.info(f"Device {device_id} with info: {device_info} disconnected")
@@ -217,6 +245,10 @@ class DeckManager:
                 self.remove_controller(controller)
 
         self.check_for_errors_if_window_ready()
+
+        # A real deck went away: re-sync, so the fake deck comes back and the app
+        # stays usable. Main loop for the same reason as in connect_new_decks().
+        GLib.idle_add(self.load_fake_decks)
 
     def remove_controller(self, deck_controller: DeckController) -> None:
         self.deck_controller.remove(deck_controller)
