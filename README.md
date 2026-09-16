@@ -28,7 +28,7 @@ All credit for the core application goes to the [StreamController](https://githu
 - **Layered images per key**: each key can hold two independent image layers on top of the page background, each with its own opacity. For example, a page background plus an animated GIF plus an icon, all composited together.
 - **Per-layer blend modes**: either image layer can use a CSS/SVG-style blend mode instead of a plain overlay. Supported modes are `normal`, `multiply`, `screen`, `darken`, `lighten`, `hard-light`, `overlay`, `color-dodge`, `color-burn`, `difference`, `exclusion`, `soft-light`. Layers blend the same way CSS `mix-blend-mode` does, so each one blends against everything already painted beneath it. Set per layer from the image editor's "Blend Mode" dropdown. Implemented per the W3C compositing spec (hard-light/overlay use the scaled forms).
 - **Smart Command**: a new stateful action type. See the source for current behavior; it is actively evolving as I use it and has no stable spec.
-- **Watch GitHub Deployments**: displays a repo's deployment status on a key. Press to refresh manually, or enable automatic updates via a local `pre-push` hook.
+- **Watch GitHub Deployments**: displays a repo's deployment status on a key. Press to refresh manually, or enable automatic updates via a local `pre-push` hook. The watch is owned by the plugin rather than by the key, so it keeps polling and keeps its last result no matter which page is on screen.
 - **Static WebP support**: support for static `.webp` images as key and background assets.
 - **Accurate GIF timing**: animated GIFs play at their native frame delays.
 - **Playback pacing**: animated backgrounds play at their configured or native frame rate.

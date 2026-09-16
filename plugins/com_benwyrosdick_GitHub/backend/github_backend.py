@@ -52,10 +52,12 @@ except Exception:  # pragma: no cover - loguru always present inside the app
 
 # Timeouts (seconds). Counts hit the network, so give them a generous budget;
 # `gh run list`/`run view` (especially with a --workflow filter) can be slow,
-# so they get more headroom; auth checks are local and quick.
+# so they get more headroom; auth checks are local and quick; the deployments
+# endpoints are polled in the background, so they get the most room.
 COUNT_TIMEOUT = 8
 RUN_TIMEOUT = 15
 AUTH_TIMEOUT = 5
+DEPLOY_TIMEOUT = 30
 
 
 class RateLimitError(Exception):
@@ -257,6 +259,47 @@ class GitHubBackend:
         total = len(steps)
         completed = sum(1 for s in steps if s.get("status") == "completed")
         return completed, total
+
+    def latest_deployment_id(self, repo: str, environment: str = "",
+                             timeout: int = DEPLOY_TIMEOUT):
+        """Newest deployment of `environment` as (deployment_id, error).
+
+        `deployment_id` is the empty string when the repo has no deployment for
+        that environment (or none at all); `error` is a message, or None. The
+        two are told apart so the caller can show "no deployment" instead of a
+        failure. Raises RateLimitError like the other reads.
+        """
+        if not repo:
+            return "", "no repo"
+        args = ["api", f"repos/{repo}/deployments", "-X", "GET", "-f", "per_page=1"]
+        if environment:
+            args += ["-f", f"environment={environment}"]
+        args += ["--jq", '.[0].id // ""']
+        ok, out, err = self._run(args, timeout=timeout)
+        if not ok:
+            self._check_rate_limit(err)
+            return "", (err or "").strip() or "failed"
+        return out.strip(), None
+
+    def deployment_state(self, repo: str, deployment_id, timeout: int = DEPLOY_TIMEOUT):
+        """Current state of one deployment as (state, error).
+
+        `state` is GitHub's own vocabulary: "pending"/"in_progress"/"queued"
+        while it runs, "success"/"failure"/"error"/"inactive" when it ends. An
+        empty string means GitHub has not published a status yet. Raises
+        RateLimitError like the other reads.
+        """
+        if not repo or not deployment_id:
+            return "", "no deployment"
+        ok, out, err = self._run(
+            ["api", f"repos/{repo}/deployments/{deployment_id}/statuses",
+             "-X", "GET", "-f", "per_page=1", "--jq", '.[0].state // ""'],
+            timeout=timeout,
+        )
+        if not ok:
+            self._check_rate_limit(err)
+            return "", (err or "").strip() or "failed"
+        return out.strip(), None
 
     def notification_count(self, repo: str = "", participating: bool = False,
                            reason: str = "",

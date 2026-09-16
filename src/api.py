@@ -607,60 +607,30 @@ class StreamDeckGBAPI:
 
     @_wrap_dbus_errors
     def TriggerDeployment(self, owner: Str, repository: Str, branch: Str) -> None:
-        """Press the configured Deployment Status action for a pushed branch."""
+        """Arm the GitHub plugin's deployment watcher for a pushed branch.
+
+        The watch is owned by the plugin and matched against the configured
+        pages, not against the pages currently on screen, so a push arms it
+        even when the key's page is not the active one (or was never loaded in
+        this session) - the keys are only views over the watch's state.
+        """
         owner = owner.strip().lower()
         repository = repository.strip().lower()
-        branch = branch.strip().lower()
+        branch = branch.strip().lower() or "production"
         action_id = "com_benwyrosdick_GitHub::DeploymentStatus"
-        triggered = 0
-        for controller in gl.deck_manager.deck_controller:
-            page = controller.active_page
-            if page is None:
-                continue
-            controller_triggered = False
-            for json_identifier, key_data in page.dict.get("keys", {}).items():
-                for state_data in key_data.get("states", {}).values():
-                    for action in state_data.get("actions", []):
-                        settings = action.get("settings", {})
-                        if action.get("id") != action_id:
-                            continue
-                        if (settings.get("owner", "").strip().lower() != owner or
-                                settings.get("repo", "").strip().lower() != repository or
-                                settings.get("environment", "production").strip().lower() != branch):
-                            continue
-                        plugin = gl.plugin_manager.get_plugin_by_id("com_benwyrosdick_GitHub")
-                        plugin.deployment_auto_triggers.add((owner, repository, branch))
-                        success, message = controller.trigger_action(json_identifier.replace("x", ","), "press")
-                        if not success:
-                            plugin.deployment_auto_triggers.discard((owner, repository, branch))
-                            raise DBusError(ERR + "InvalidArgument", message)
-                        def restart_if_cleared(
-                            controller=controller,
-                            coords=json_identifier.replace("x", ","),
-                            owner=owner,
-                            repository=repository,
-                            branch=branch,
-                        ):
-                            plugin = gl.plugin_manager.get_plugin_by_id("com_benwyrosdick_GitHub")
-                            active = any(
-                                key[:3] == (owner, repository, branch) and value.get("state") != "idle"
-                                for key, value in plugin.deployment_watchers.items()
-                            )
-                            if not active:
-                                controller.trigger_action(coords, "press")
-                            return GLib.SOURCE_REMOVE
 
-                        GLib.timeout_add(300, restart_if_cleared)
-                        triggered += 1
-                        controller_triggered = True
-                        break
-                    if controller_triggered:
-                        break
-                if controller_triggered:
-                    break
-        if not triggered:
+        # Daemon-only mode loads just the plugins referenced by the active
+        # page, so make sure the deployment action's plugin is up.
+        try:
+            gl.plugin_manager.ensure_action_holder_loaded(action_id)
+        except Exception as e:
+            log.warning(f"DBus API: could not load {action_id}: {e}")
+
+        plugin = gl.plugin_manager.get_plugin_by_id("com_benwyrosdick_GitHub")
+        trigger = getattr(plugin, "trigger_deployment", None)
+        if trigger is None or not trigger(owner, repository, branch):
             raise DBusError(ERR + "NotFound",
-                            f"No active Deployment Status action matches {owner}/{repository}/deployments/{branch}")
+                            f"No Deployment Status action watches {owner}/{repository}/deployments/{branch}")
 
     # ── Properties ───────────────────────────────────────────────────
 

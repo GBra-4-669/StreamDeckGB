@@ -4,19 +4,27 @@ from src.backend.PluginManager.ActionHolder import ActionHolder
 from src.backend.PluginManager.ActionInputSupport import ActionInputSupport
 from src.backend.DeckManagement.InputIdentifier import Input
 
+import json
+import os
 import time
 import threading
+
+from gi.repository import GLib
+from loguru import logger as log
 
 # Relative imports anchor every module to this plugin's package. Absolute
 # top-level names like `actions`/`backend` would collide with the identically
 # named packages other installed plugins register in sys.modules.
 from .backend.github_backend import GitHubBackend, RateLimitError
+from .backend.deployment_watchers import DeploymentWatcherService, target_key
 
 from .actions.PRCount.PRCount import PRCount
 from .actions.IssueCount.IssueCount import IssueCount
 from .actions.CIStatus.CIStatus import CIStatus
 from .actions.NotificationCount.NotificationCount import NotificationCount
 from .actions.DeploymentStatus.DeploymentStatus import DeploymentStatus
+
+DEPLOYMENT_ACTION_ID = "com_benwyrosdick_GitHub::DeploymentStatus"
 
 
 class GitHubPlugin(PluginBase):
@@ -25,8 +33,17 @@ class GitHubPlugin(PluginBase):
 
         self.lm = self.locale_manager
         self.backend = GitHubBackend()
-        self.deployment_watchers = {}
-        self.deployment_auto_triggers = set()
+
+        # Deployment Status watch: owned here, not by the key. The service keeps
+        # polling and caching the last state per repo/environment whatever page
+        # is on screen, so a key that comes back (or a push that arrives while
+        # its page is hidden) still sees the current status. See
+        # backend/deployment_watchers.py.
+        self.deployment_watchers = DeploymentWatcherService(
+            poller=self.backend,
+            dispatch=GLib.idle_add,
+            on_rate_limited=self._note_rate_limited,
+        )
 
         # Generic async value cache. Every backend read hits the network, so it
         # must never run on the UI thread: getters return the cached value
@@ -185,6 +202,70 @@ class GitHubPlugin(PluginBase):
             until = self._rate_limit_until
         if until and time.time() < until:
             return until
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Deployment Status watch (called by the D-Bus API)
+    # ------------------------------------------------------------------ #
+    def trigger_deployment(self, owner: str, repository: str,
+                           environment: str = "production") -> bool:
+        """Arm the deployment watch for a branch that was just pushed.
+
+        Called by the app's `--trigger-deployment` (the local pre-push hook).
+        Matching is done against the configured page files rather than the
+        pages on screen, so the watch starts even when the key's page is not
+        the active one - or was not loaded at all in this session. Returns
+        False when no key with push auto-trigger watches that repo.
+        """
+        target = target_key(owner, repository, environment)
+        settings = self._deployment_key_settings(target)
+        if settings is None:
+            return False
+        return self.deployment_watchers.arm(
+            target,
+            wait_for_new=True,
+            timeout=max(1, int(settings.get("timeout_seconds", 600))),
+            interval=max(3, int(settings.get("poll_interval_seconds", 10))),
+        )
+
+    def _deployment_key_settings(self, target):
+        """Settings of the first DeploymentStatus key configured for `target`.
+
+        Reads the page files directly: the keys that care about a deployment
+        are not necessarily on a loaded page when the push arrives, and the
+        settings of one of them are all the watch needs (timeout, interval).
+        """
+        try:
+            import globals as gl
+            pages_dir = os.path.join(gl.DATA_PATH, "pages")
+            page_names = sorted(os.listdir(pages_dir))
+        except Exception as e:
+            log.warning("[github] could not list pages for trigger: {}", e)
+            return None
+
+        for name in page_names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(pages_dir, name), "r") as f:
+                    page = json.load(f)
+            except (OSError, ValueError):
+                continue
+            for collection in ("keys", "dials", "touchscreens"):
+                for input_data in (page.get(collection) or {}).values():
+                    for state_data in (input_data.get("states") or {}).values():
+                        for action in (state_data.get("actions") or []):
+                            if not action or action.get("id") != DEPLOYMENT_ACTION_ID:
+                                continue
+                            settings = action.get("settings") or {}
+                            if not settings.get("auto_trigger"):
+                                continue
+                            key_target = target_key(
+                                settings.get("owner", ""), settings.get("repo", ""),
+                                settings.get("environment", "production"),
+                            )
+                            if key_target == target:
+                                return settings
         return None
 
     # ------------------------------------------------------------------ #

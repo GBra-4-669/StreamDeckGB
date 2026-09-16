@@ -1,6 +1,5 @@
 import subprocess
 import threading
-import time
 from pathlib import Path
 
 import gi
@@ -9,37 +8,65 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib
 from gi.repository import Gtk
+from loguru import logger as log
 
+from ...backend.deployment_watchers import PENDING_STATES, TERMINAL_STATES, target_key
 from ..base.GitHubActionBase import GitHubActionBase
 
 
 class DeploymentStatus(GitHubActionBase):
+    """Shows a repo deployment's status on a key.
+
+    The key is only a view: the plugin's DeploymentWatcherService
+    (backend/deployment_watchers.py) owns the polling and the state per repo,
+    so the watch keeps running - and keeps its last result - no matter which
+    page is on screen. This class reads the state when it renders and is pushed
+    updates through `on_deployment_state`.
+    """
+
     HOOK_MARKER = "# streamcontroller-github-deployment-watcher"
-    PENDING = {"pending", "in_progress", "queued"}
-    TERMINAL = {"success", "failure", "error", "inactive"}
+    PENDING = PENDING_STATES
+    TERMINAL = TERMINAL_STATES
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.has_configuration = True
-        self._cancel = threading.Event()
-        self._lock = threading.Lock()
-        self._watching = False
         self._blink = False
         self._blink_timer_id = None
-    def _shared(self):
+        # Target of this key, resolved from the settings while the page is
+        # loaded and kept afterwards: the watch outlives the action object and
+        # we must still be able to name our target when the page is swapped out
+        # (ActionCore.get_settings() returns {} once the action has no page).
+        self._target = None
+        self._watch_settings = {}
+
+    @property
+    def deployment_target(self):
+        """(owner, repo, environment) this key shows, or None before the first
+        render. Read by the watcher service to route state updates."""
+        return self._target
+
+    def _resolve_target(self):
+        """Refresh the cached target from the settings; keep the last one when
+        the settings are unavailable (page gone, action out of the page)."""
         settings = self.get_settings()
-        self._watch_key = (
-            settings.get("owner", "").strip().lower(),
-            settings.get("repo", "").strip().lower(),
-            settings.get("environment", "production").strip().lower() or "production",
-            int(settings.get("timeout_seconds", 600)),
-            max(3, int(settings.get("poll_interval_seconds", 10))),
+        if not settings:
+            return self._target
+        self._target = target_key(
+            settings.get("owner", ""), settings.get("repo", ""),
+            settings.get("environment", "production"),
         )
-        watchers = self.plugin_base.deployment_watchers
-        return watchers.setdefault(self._watch_key, {
-            "state": "idle",
-            "cancel": threading.Event(),
-        })
+        self._watch_settings = {
+            "timeout": max(1, int(settings.get("timeout_seconds", 600))),
+            "interval": max(3, int(settings.get("poll_interval_seconds", 10))),
+        }
+        return self._target
+
+    def _state(self):
+        target = self._target
+        if target is None or not target[1]:
+            return "idle"
+        return self.plugin_base.deployment_watchers.state_for(target)
 
     def get_config_rows(self) -> list:
         rows = []
@@ -160,120 +187,62 @@ class DeploymentStatus(GitHubActionBase):
         settings[key] = int(row.get_value())
         self.set_settings(settings)
 
+    # ------------------------------------------------------------------ #
+    # Lifecycle: this key renders the watcher's state, it never owns it
+    # ------------------------------------------------------------------ #
     def on_ready(self):
-        state = self._shared()["state"]
-        if state == "idle":
-            self._set_idle()
-        else:
-            self._render(state)
+        self._resolve_target()
+        try:
+            self.plugin_base.deployment_watchers.register_view(self)
+        except Exception:
+            pass
+        # Resumes from the watcher's cached state, so a key whose page was off
+        # screen (or re-created) paints the current status instead of nothing.
+        log.debug("[github] deployment key ready target={} state={}",
+                  self._target, self._state())
+        self._render(self._state())
 
-    def on_tick(self):
-        state = self._shared()["state"]
+    def on_remove(self):
+        self._unregister_view()
+
+    def on_removed_from_cache(self):
+        # The page this key lives on was dropped: the watch itself carries on.
+        self._unregister_view()
+        super().on_removed_from_cache()
+
+    def _unregister_view(self):
+        try:
+            self.plugin_base.deployment_watchers.unregister_view(self)
+        except Exception:
+            pass
+
+    def on_deployment_state(self, state):
+        """Pushed by the watcher service (on the main thread) on every change."""
+        self._resolve_target()
+        log.debug("[github] deployment key {} -> {}", self._target, state)
         self._render(state)
 
+    def on_tick(self):
+        self._resolve_target()
+        self._render(self._state())
+
     def on_key_down(self):
-        with self._lock:
-            shared = self._shared()
-            if shared["state"] in {"pending", "in_progress", "queued"}:
-                shared["cancel"].set()
-                shared["state"] = "idle"
-                self._watching = False
-                GLib.idle_add(self._set_idle)
-                return
-            if shared["state"] in {
-                "success", "failure", "error", "inactive",
-                "no_deployment", "timeout", "auth",
-            }:
-                shared["state"] = "idle"
-                GLib.idle_add(self._set_idle)
-                return
-            self._watching = True
-            shared["cancel"] = threading.Event()
-            shared["state"] = "pending"
-            trigger_key = (
-                self.get_settings().get("owner", "").strip().lower(),
-                self.get_settings().get("repo", "").strip().lower(),
-                self.get_settings().get("environment", "production").strip().lower() or "production",
-            )
-            shared["wait_for_new"] = trigger_key in self.plugin_base.deployment_auto_triggers
-            self.plugin_base.deployment_auto_triggers.discard(trigger_key)
-            self._cancel = shared["cancel"]
-        self._render("pending")
-        threading.Thread(target=self._watch, daemon=True, name="github-deployment-watch").start()
-
-    def _watch(self):
-        settings = self.get_settings()
-        owner = settings.get("owner", "").strip()
-        repo = settings.get("repo", "").strip()
-        environment = settings.get("environment", "production").strip() or "production"
-        timeout = max(1, int(settings.get("timeout_seconds", 600)))
-        interval = max(3, int(settings.get("poll_interval_seconds", 10)))
-        if not owner or not repo:
-            GLib.idle_add(self._render, "no_deployment")
+        target = self._resolve_target()
+        watchers = self.plugin_base.deployment_watchers
+        if target is None or not target[1]:
+            self._render("no_deployment")
             return
-
-        deployment_id, error = self._gh(
-            f"repos/{owner}/{repo}/deployments?environment={environment}&per_page=1",
-            ".[0].id",
-        )
-        if error or not deployment_id:
-            GLib.idle_add(self._render, "auth" if error else "no_deployment")
+        state = watchers.state_for(target)
+        if state != "idle":
+            # Press again to drop the current watch/result; the next press
+            # starts a fresh one. Painted from the main thread, as before.
+            watchers.reset(target)
+            GLib.idle_add(self._set_idle)
             return
-
-        started = time.monotonic()
-        if self._shared().get("wait_for_new"):
-            baseline_id = deployment_id
-            deployment_id = ""
-            while not self._cancel.is_set() and time.monotonic() - started < timeout:
-                deployment_id, error = self._gh(
-                    f"repos/{owner}/{repo}/deployments?environment={environment}&per_page=1",
-                    ".[0].id",
-                )
-                if error:
-                    GLib.idle_add(self._render, "auth")
-                    return
-                if deployment_id and deployment_id != baseline_id:
-                    break
-                self._cancel.wait(interval)
-            if not deployment_id or deployment_id == baseline_id:
-                GLib.idle_add(self._render, "timeout")
-                return
-        while not self._cancel.is_set():
-            if time.monotonic() - started >= timeout:
-                GLib.idle_add(self._render, "timeout")
-                return
-            state, error = self._gh(
-                f"repos/{owner}/{repo}/deployments/{deployment_id}/statuses?per_page=1",
-                ".[0].state",
-            )
-            if error:
-                GLib.idle_add(self._render, "auth")
-                return
-            state = (state or "pending").lower()
-            GLib.idle_add(self._render, state if state in self.PENDING | self.TERMINAL else "pending")
-            if state in self.TERMINAL:
-                return
-            self._cancel.wait(interval)
-
-    @staticmethod
-    def _gh(endpoint, query):
-        result = subprocess.run(
-            ["gh", "api", endpoint, "--jq", query],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            return "", result.stderr.strip()
-        return result.stdout.strip(), ""
+        watchers.arm(target, wait_for_new=False, **self._watch_settings)
+        self._render(self._state())
 
     def _render(self, state):
-        shared = self._shared()
-        if state != "idle":
-            shared["state"] = state
-        with self._lock:
-            if state == "idle":
-                self._watching = False
         if state in self.PENDING:
             self.set_status_badge((255, 200, 0, 255))
             self.safe_set_label("top", "", font_size=1)
@@ -312,14 +281,11 @@ class DeploymentStatus(GitHubActionBase):
 
     def _blink_timeout(self):
         self._blink_timer_id = None
-        if self._shared()["state"] == "timeout":
+        if self._state() == "timeout":
             self._render("timeout")
         return GLib.SOURCE_REMOVE
 
     def _set_idle(self):
-        self._cancel.set()
-        self._watching = False
-        self._shared()["state"] = "idle"
         self.set_status_badge(None)
         self.safe_set_label("top", "", font_size=1)
         self.safe_set_label("center", "", font_size=1)

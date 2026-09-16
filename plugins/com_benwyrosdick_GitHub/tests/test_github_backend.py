@@ -158,6 +158,67 @@ def test_notification_count_none_on_failure():
 
 
 # --------------------------------------------------------------------------- #
+# latest_deployment_id() / deployment_state()
+# --------------------------------------------------------------------------- #
+def test_latest_deployment_id_reads_the_newest_id():
+    b = make_backend(recording_run((True, "4242\n", "")))
+    assert b.latest_deployment_id("owner/repo", "production") == ("4242", None)
+    args = b._run.calls[0]
+    assert "repos/owner/repo/deployments" in args
+    assert "environment=production" in args
+    assert args[args.index("--jq") + 1] == '.[0].id // ""'
+
+
+def test_latest_deployment_id_without_environment_omits_the_filter():
+    b = make_backend(recording_run((True, "1", "")))
+    b.latest_deployment_id("owner/repo")
+    assert not any(a.startswith("environment=") for a in b._run.calls[0])
+
+
+def test_latest_deployment_id_no_deployment_is_not_an_error():
+    b = make_backend(recording_run((True, "\n", "")))
+    assert b.latest_deployment_id("owner/repo") == ("", None)
+
+
+def test_latest_deployment_id_failure_reports_the_error():
+    b = make_backend(recording_run((False, "", "HTTP 404")))
+    assert b.latest_deployment_id("owner/repo") == ("", "HTTP 404")
+
+
+def test_latest_deployment_id_no_repo_short_circuits():
+    b = make_backend(recording_run((True, "1", "")))
+    assert b.latest_deployment_id("") == ("", "no repo")
+    assert b._run.calls == []
+
+
+def test_latest_deployment_id_raises_on_rate_limit():
+    b = GitHubBackend()
+    b._run = lambda args, timeout=None: (False, "", "API rate limit exceeded")  # type: ignore[method-assign]
+    b._rate_limit_reset = lambda: 99.0  # type: ignore[method-assign]
+    with pytest.raises(RateLimitError):
+        b.latest_deployment_id("owner/repo")
+
+
+def test_deployment_state_reads_the_status_of_one_deployment():
+    b = make_backend(recording_run((True, "in_progress\n", "")))
+    assert b.deployment_state("owner/repo", 7) == ("in_progress", None)
+    args = b._run.calls[0]
+    assert "repos/owner/repo/deployments/7/statuses" in args
+    assert args[args.index("--jq") + 1] == '.[0].state // ""'
+
+
+def test_deployment_state_without_a_deployment_short_circuits():
+    b = make_backend(recording_run((True, "success", "")))
+    assert b.deployment_state("owner/repo", "") == ("", "no deployment")
+    assert b._run.calls == []
+
+
+def test_deployment_state_failure_reports_the_error():
+    b = make_backend(recording_run((False, "", "boom")))
+    assert b.deployment_state("owner/repo", 1) == ("", "boom")
+
+
+# --------------------------------------------------------------------------- #
 # _check_rate_limit()
 # --------------------------------------------------------------------------- #
 def test_check_rate_limit_raises_with_reset_epoch():
