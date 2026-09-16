@@ -36,6 +36,12 @@ class TrayIcon(DBusTrayIcon):
         self.set_icon(self.IconName, path=self.get_icon_theme_path())
         self.set_tooltip("StreamDeckGB")
 
+        # Hardware comes and goes while the app runs, and a fake deck can stand in
+        # only while none is attached, so re-check rather than deciding once at
+        # startup. Here and not in start(), which the settings window calls on
+        # every toggle - that would stack up one timer per toggle.
+        GLib.timeout_add_seconds(2, self._sync_tick)
+
         self.main_win = None
         self.show_about_action = None
         self.show_store_action = None
@@ -74,6 +80,32 @@ class TrayIcon(DBusTrayIcon):
     @log.catch
     def stop(self):
         self.unregister()
+
+    def _sync_tick(self) -> bool:
+        self.sync_with_hardware()
+        return True
+
+    @log.catch
+    def sync_with_hardware(self) -> None:
+        """
+        Optional: with no hardware attached an on-screen deck can supply the bar
+        icon for the very same thing, and this tray icon would then sit next to it
+        as a second, contradictory icon. Opt in with
+        dev.hide-tray-icon-without-hardware - off by default, because a tray icon
+        that disappears on its own is surprising unless you asked for it.
+        """
+        app_settings = gl.settings_manager.get_app_settings()
+        if not app_settings.get("dev", {}).get("hide-tray-icon-without-hardware"):
+            return
+        if not app_settings.get("ui", {}).get("tray-icon", True):
+            return  # the tray icon is switched off in the settings anyway
+        manager = gl.deck_manager
+        if manager is None:
+            return
+        if manager.has_hardware_deck():
+            self.register()
+        else:
+            self.unregister()
 
     def _ensure_window(self) -> bool:
         """Make sure the main window exists and the tray actions are wired.
