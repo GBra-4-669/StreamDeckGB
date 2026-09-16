@@ -102,10 +102,12 @@ class TrayIcon(DBusTrayIcon):
         manager = gl.deck_manager
         if manager is None:
             return
+        # Status, not register/unregister: the host keeps showing an item whose
+        # object was removed, so unregistering left the icon on screen.
         if manager.has_hardware_deck():
-            self.register()
+            self.set_status("Active")
         else:
-            self.unregister()
+            self.set_status("Passive")
 
     def _ensure_window(self) -> bool:
         """Make sure the main window exists and the tray actions are wired.

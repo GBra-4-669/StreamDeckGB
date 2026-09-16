@@ -482,6 +482,29 @@ class StatusNotifierItemService(DBusService):
             (label, "")
         )
 
+    def set_status(self, status: str):
+        """
+        SNI's own way of not being shown: a host hides an item whose Status is
+        "Passive". Unregistering the object instead does not work in practice -
+        the host keeps showing an item it has already added, so the icon stays
+        on screen even though the object is gone.
+        """
+        self.Status = status
+
+        # PropertiesChanged is not one of this interface's own signals, so it is
+        # emitted directly rather than through emit_signal(), which only knows
+        # the signals the interface node declares.
+        self.bus.emit_signal(
+            destination_bus_name=None,
+            object_path=self.object_path,
+            interface_name="org.freedesktop.DBus.Properties",
+            signal_name="PropertiesChanged",
+            parameters=GLib.Variant(
+                "(sa{sv}as)",
+                (self.interface_info.name, {"Status": GLib.Variant("s", status)}, []),
+            )
+        )
+
 class DBusTrayIcon:
     def __init__(self, menu = None, path = "", menu_path = "", app_id = "", title = "",
                  activate_callback=None):
@@ -515,6 +538,9 @@ class DBusTrayIcon:
 
     def set_label(self, label):
         self.sni_service.set_xayatanalabel(label)
+
+    def set_status(self, status):
+        self.sni_service.set_status(status)
 
     def update_menu(self):
         self.sni_service.set_items(self.menu.get_items())
