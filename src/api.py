@@ -742,6 +742,7 @@ def unpublish_controller(controller) -> None:
         return
     try:
         _bus.unpublish_object(f"{CONTROLLER_BASE_PATH}/{_serial_to_dbus_path(serial)}")
+        log.info(f"DBus API: unpublished controller {serial}")
     except Exception as e:
         log.error(f"DBus API: failed to unpublish controller {controller.safe_serial_number()}: {e}")
 
@@ -758,6 +759,18 @@ def _publish_controller(controller):
     instance._object_path = obj_path
     _controller_instances[serial] = instance
     _bus.publish_object(obj_path, instance)
+
+    # Seed the page name. notify_active_page_changed() only fires on a page
+    # change, so an object published after its deck had already loaded a page
+    # answered "" until the next navigation - and that value is how a client
+    # knows which page to draw.
+    active = getattr(controller, "active_page", None)
+    if active is not None:
+        try:
+            instance.ActivePageName = active.get_name()
+        except Exception as e:
+            log.error(f"DBus API: could not seed the page name for {serial}: {e}")
+
     log.info(f"DBus API: published controller {serial} at {obj_path}")
 
 
