@@ -35,6 +35,7 @@ from src.backend.PageManagement.PageManagerBackend import PageManagerBackend
 from src.backend.SettingsManager import SettingsManager
 from src.backend.DeckManagement.HelperMethods import get_sys_param_value, recursive_hasattr
 from src.backend.DeckManagement.Subclasses.FakeDeck import DEFAULT_FAKE_DECK_TYPE, FakeDeck
+from src.api import publish_controller, unpublish_controller
 
 # Import globals first to get IS_MAC
 import globals as gl
@@ -252,6 +253,9 @@ class DeckManager:
 
     def remove_controller(self, deck_controller: DeckController) -> None:
         self.deck_controller.remove(deck_controller)
+        # Its D-Bus object goes with it: left behind, a removed fake deck stayed
+        # in the tree next to the real one that replaced it.
+        unpublish_controller(deck_controller)
         if recursive_hasattr(gl, "app.main_win.leftArea.deck_stack"):
             # remove_controller() is called from non-GTK threads (e.g.
             # FlatpakDeckDisconnectThread, udev callbacks); route the GTK call
@@ -292,6 +296,10 @@ class DeckManager:
         self.deck_controller.append(deck_controller)
         if is_fake:
             self.fake_deck_controller.append(deck_controller)
+
+        # Publish its D-Bus object now rather than waiting for the next start, so
+        # a deck that connects later still has a readable ActivePageName.
+        publish_controller(deck_controller)
 
         if not recursive_hasattr(gl, "app.main_win."):
             return

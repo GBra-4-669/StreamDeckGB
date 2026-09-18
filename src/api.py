@@ -617,6 +617,19 @@ class StreamDeckGBAPI:
             raise DBusError(ERR + "InvalidArgument", message)
 
     @_wrap_dbus_errors
+    def KeyLayout(self, serial: Str) -> Str:
+        """The key grid as "rowsxcols" (e.g. "3x5").
+
+        The shape of the deck, for clients that draw it or address its keys.
+        Asking for it used to mean making a press that cannot exist and reading
+        the range out of the refusal - which worked, but logged a warning and a
+        traceback every time, and deck-state does it once a second.
+        """
+        controller = self._require_controller(serial)
+        rows, cols = controller.deck.key_layout()
+        return f"{rows}x{cols}"
+
+    @_wrap_dbus_errors
     def TriggerDeployment(self, owner: Str, repository: Str, branch: Str) -> None:
         """Arm the GitHub plugin's deployment watcher for a pushed branch.
 
@@ -694,11 +707,43 @@ def start_dbus_service():
         # Publish a sub-object for each connected controller
         if gl.deck_manager is not None:
             for controller in gl.deck_manager.deck_controller:
-                _publish_controller(controller)
+                publish_controller(controller)
 
         log.success(f"DBus API published at {DBUS_OBJECT_PATH}")
     except Exception as e:
         log.error(f"Failed to start DBus API service: {e}")
+
+
+def publish_controller(controller) -> None:
+    """Publish a controller's API object.
+
+    Called for every deck that connects, not only for the ones that exist when
+    the service starts: a deck plugged in later had no object, so its
+    ActivePageName could not be read at all - a client then only had its own
+    guess at which page the deck is on.
+    """
+    if _bus is None:
+        return
+    try:
+        _publish_controller(controller)
+    except Exception as e:
+        log.error(f"DBus API: failed to publish controller {controller.safe_serial_number()}: {e}")
+
+
+def unpublish_controller(controller) -> None:
+    """Drop a controller's API object when its deck goes away.
+
+    Without this the object outlived the deck: a removed fake deck stayed in the
+    tree (and in ActivePageName reads) next to the real one that replaced it.
+    """
+    serial = controller.serial_number()
+    instance = _controller_instances.pop(serial, None)
+    if instance is None or _bus is None:
+        return
+    try:
+        _bus.unpublish_object(f"{CONTROLLER_BASE_PATH}/{_serial_to_dbus_path(serial)}")
+    except Exception as e:
+        log.error(f"DBus API: failed to unpublish controller {controller.safe_serial_number()}: {e}")
 
 
 def _publish_controller(controller):
