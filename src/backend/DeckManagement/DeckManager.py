@@ -197,6 +197,10 @@ class DeckManager:
             self.fake_deck_controller.remove(controller)
             # Remove controller from main list
             self.deck_controller.remove(controller)
+            # Its D-Bus object goes too: this path does not go through
+            # remove_controller(), and the object used to outlive the fake deck
+            # (it stayed readable next to the real one that replaced it).
+            unpublish_controller(controller)
             # Remove deck page on stack
             if recursive_hasattr(gl, "app.main_win.leftArea.deck_stack"):
                 gl.app.main_win.leftArea.deck_stack.remove_page(controller)
