@@ -92,6 +92,8 @@ class DeploymentWatcherService:
         self._on_rate_limited = on_rate_limited
         self._lock = threading.RLock()
         self._watches = {}   # target -> watch dict
+        self._known = {}     # target -> last state read, watch or not
+        self._reads = set()  # targets with a one-shot read in flight
         self._views = []     # live DeploymentStatus actions
 
     # ------------------------------------------------------------------ #
@@ -127,12 +129,83 @@ class DeploymentWatcherService:
         """Last known state of `target`, or "idle" when nothing is known."""
         with self._lock:
             watch = self._watches.get(target)
-            return watch["state"] if watch else "idle"
+            if watch:
+                return watch["state"]
+            return self._known.get(target, "idle")
 
     def is_running(self, target) -> bool:
         with self._lock:
             watch = self._watches.get(target)
             return bool(watch and watch["running"])
+
+    def read_once(self, target) -> bool:
+        """Read the newest deployment's state once, without starting a watch.
+
+        A watch follows a deployment that is being created; this only answers
+        "what is the status right now", which is what a key with nothing known
+        about it needs - so it paints the real state instead of an empty key,
+        and pressing the key afterwards still starts a proper watch.
+        """
+        if not target or not target[1]:
+            return False
+        with self._lock:
+            watch = self._watches.get(target)
+            if watch and watch["running"]:
+                return False                      # a watch owns this target already
+            if self._known.get(target, "idle") != "idle":
+                return False                      # a state is already known
+            if target in self._reads:
+                return False                      # its read is in flight
+            self._reads.add(target)
+        threading.Thread(target=self._read, args=(target,),
+                         daemon=True, name=f"github-deployment-read:{target[1]}").start()
+        return True
+
+    def _read(self, target) -> None:
+        owner, repo, environment = target
+        try:
+            deployment_id, error = self._poller.latest_deployment_id(
+                f"{owner}/{repo}", environment)
+            if error:
+                self._remember(target, "auth")
+                return
+            if not deployment_id:
+                self._remember(target, "no_deployment")
+                return
+            state, error = self._poller.deployment_state(
+                f"{owner}/{repo}", deployment_id)
+            if error:
+                self._remember(target, "auth")
+                return
+            state = (state or "").lower()
+            if state not in PENDING_STATES and state not in TERMINAL_STATES:
+                state = "pending"
+            self._remember(target, state)
+        except RateLimitError as e:
+            if self._on_rate_limited is not None:
+                try:
+                    self._on_rate_limited(e.reset_epoch)
+                except Exception:
+                    pass
+            self._remember(target, "auth")
+        except Exception as e:
+            log.error("[github] deployment read for {} failed: {}", target, e)
+            self._remember(target, "auth")
+        finally:
+            with self._lock:
+                self._reads.discard(target)
+
+    def _remember(self, target, state: str) -> None:
+        """Cache a state read outside a watch, and push it to the views."""
+        with self._lock:
+            watch = self._watches.get(target)
+            if watch and watch["running"]:
+                return          # a live watch owns the state now
+            if self._known.get(target) == state:
+                return
+            self._known[target] = state
+        log.debug("[github] deployment {} read as {}", target, state)
+        self._notify(target, state)
 
     def arm(self, target, wait_for_new: bool = False,
             timeout: int = None, interval: int = None) -> bool:
@@ -177,6 +250,7 @@ class DeploymentWatcherService:
         so the next press starts a fresh watch)."""
         with self._lock:
             watch = self._watches.pop(target, None)
+            self._known.pop(target, None)
             if watch is not None:
                 watch["cancel"].set()
         self._notify(target, "idle")
@@ -194,6 +268,9 @@ class DeploymentWatcherService:
                 return
             watch["state"] = state
             watch["running"] = running
+            # A finished watch still leaves a status behind: the key is a view
+            # of the last known state, and "no watch" must not mean "no status".
+            self._known[target] = state
         log.debug("[github] deployment {} -> {}{}", target, state,
                   "" if running else " (done)")
         self._notify(target, state)

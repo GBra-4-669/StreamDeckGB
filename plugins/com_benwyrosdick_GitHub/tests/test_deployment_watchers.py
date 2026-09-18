@@ -373,3 +373,84 @@ def test_state_outlives_the_view_that_started_the_watch():
     second_view = FakeView(target)
     svc.register_view(second_view)
     assert svc.state_for(target) == "success"
+
+
+# --------------------------------------------------------------------------- #
+# Reading a status with no watch (a key that nothing has pushed to)
+# --------------------------------------------------------------------------- #
+def test_read_once_paints_the_newest_state_without_watching():
+    """The bug: a key whose target nothing has pushed to painted nothing at
+    all, because a watch - started by a push or a press - was the only thing
+    that ever fetched. Reading once must show the real status, and must not
+    leave a watch behind."""
+    poller = FakePoller(ids=("7",), states=("success",))
+    svc = DeploymentWatcherService(poller)
+    target = target_key("o", "r")
+    view = FakeView(target)
+    svc.register_view(view)
+
+    assert svc.read_once(target) is True
+    assert wait_for(lambda: view.states == ["success"])
+    assert svc.state_for(target) == "success"
+    assert svc.is_running(target) is False
+    assert svc.snapshot() == {}                 # nothing is being followed
+    assert poller.id_calls == [("o/r", "production")]
+
+
+def test_read_once_without_deployments_says_so():
+    svc = DeploymentWatcherService(FakePoller(ids=("",)))
+    target = target_key("o", "r")
+    assert svc.read_once(target) is True
+    assert wait_for(lambda: svc.state_for(target) == "no_deployment")
+
+
+def test_read_once_reports_a_failed_query_as_auth():
+    svc = DeploymentWatcherService(FakePoller(id_error="gh: not logged in"))
+    target = target_key("o", "r")
+    assert svc.read_once(target) is True
+    assert wait_for(lambda: svc.state_for(target) == "auth")
+
+
+def test_read_once_is_one_read_however_often_it_is_asked():
+    gate = threading.Event()
+    poller = FakePoller(ids=("7",), states=("in_progress",), state_gates=[gate])
+    svc = DeploymentWatcherService(poller)
+    target = target_key("o", "r")
+    view = FakeView(target)
+    svc.register_view(view)
+
+    assert svc.read_once(target) is True
+    assert wait_for(lambda: len(poller.state_calls) == 1)
+    assert svc.read_once(target) is False        # in flight: no second read
+    gate.set()
+    assert wait_for(lambda: svc.state_for(target) == "in_progress")
+    assert svc.read_once(target) is False        # already known
+    assert len(poller.id_calls) == 1
+
+
+def test_read_once_never_joins_a_running_watch():
+    """A watch owns the target; a read must not race it or clobber its state."""
+    gate = threading.Event()
+    poller = FakePoller(ids=("7",), states=("in_progress",), state_gates=[gate])
+    svc = DeploymentWatcherService(poller)
+    target = target_key("o", "r")
+    assert svc.arm(target, timeout=30) is True
+    assert svc.read_once(target) is False
+    assert len(poller.id_calls) == 1             # the watch's own first read
+    gate.set()
+    assert wait_for(lambda: svc.state_for(target) == "in_progress")
+
+
+def test_reset_forgets_a_read_state_too():
+    """A press clears the key (press again for a fresh watch), and that must
+    include a state that came from a read rather than from a watch."""
+    svc = DeploymentWatcherService(FakePoller(ids=("7",), states=("success",)))
+    target = target_key("o", "r")
+    view = FakeView(target)
+    svc.register_view(view)
+    svc.read_once(target)
+    assert wait_for(lambda: svc.state_for(target) == "success")
+
+    svc.reset(target)
+    assert svc.state_for(target) == "idle"
+    assert view.states[-1] == "idle"

@@ -191,9 +191,18 @@ class DeploymentStatus(GitHubActionBase):
     # Lifecycle: this key renders the watcher's state, it never owns it
     # ------------------------------------------------------------------ #
     def on_ready(self):
-        self._resolve_target()
+        target = self._resolve_target()
         try:
             self.plugin_base.deployment_watchers.register_view(self)
+        except Exception:
+            pass
+        # Nothing is known about this target yet (a fresh app start, or a repo
+        # nobody has pushed to since): read the newest deployment once, so the
+        # key paints the real status instead of the empty key "idle" draws. It
+        # only reads - pressing the key still arms a watch that follows one.
+        try:
+            if target:
+                self.plugin_base.deployment_watchers.read_once(target)
         except Exception:
             pass
         # Resumes from the watcher's cached state, so a key whose page was off
