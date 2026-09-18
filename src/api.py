@@ -597,6 +597,17 @@ class StreamDeckGBAPI:
         controller = self._require_controller(serial)
         page_path = self._get_page_path(page_name)
 
+        # Bounds first, page second - the order ChangeState() already uses. The
+        # other way round made a refused press a page change, and clients ask for
+        # a key that cannot exist to learn the grid: deck-state does exactly that
+        # once a second, and whenever it cannot read the active page it passes
+        # "home", so every poll pulled the deck back to the home page.
+        identifier = ops.identifier_from_coords(coords)
+        rows, cols = controller.deck.key_layout()
+        x, y = identifier.coords
+        if x < 0 or x >= cols or y < 0 or y >= rows:
+            raise DBusError(ERR + "InvalidArgument", f"Coordinates ({x},{y}) are out of bounds. Valid range: x=0-{cols-1}, y=0-{rows-1}")
+
         if controller.active_page is None or os.path.abspath(page_path) != os.path.abspath(controller.active_page.json_path):
             page = gl.page_manager.get_page(page_path, controller)
             controller.load_page(page)
